@@ -1,0 +1,269 @@
+library(Rcpp)
+library(nloptr)
+library('dplyr')
+library(doParallel)
+library(foreach)
+
+
+n_treats_start <-10 #number of treatments
+min_n <- 100 #min number of patients per arm needed before interim analysis
+max_n <- 200 #max number of patients per arm needed for trial conclusion 
+thresh_sup <- 0.961976477354765
+thresh_fut <-0
+mu0 <- 5
+n0 <- 50
+alpha0<-n0/2
+beta0 <- (9*n0)/2
+treats <- c("T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10")
+recruit<- 50#recruit rate
+nsamps<-10000
+n0a<-5
+alpha_a <-n0a/2
+beta_a <- (9*n0a)/2
+simulation <- function(n_treats,
+                       min_n,
+                       max_n,
+                       thresh_sup,
+                       thresh_fut,
+                       mu0,
+                       alpha0,
+                       beta0,
+                       n0, 
+                       treats,
+                       recruit){
+  n_treats <- n_treats_start
+  recruit_rate <- matrix(recruit,1, n_treats); colnames(recruit_rate) <- treats
+  Result = array(dim=c(2,n_treats), 
+                 dimnames = list(c("Sample.size", "Result"),treats))
+  ind <- matrix(0,1, n_treats); colnames(ind) <- treats
+  
+  
+  ##simulate prior data
+  t<-matrix(NA, nrow=min_n, ncol=n_treats)
+  #n_samples <- matrix(0,1,n_treats);colnames(n_samples) <- treats
+  
+  tau = rgamma(1, alpha0, beta0)
+  mu = rnorm(1, mu0, sqrt(1/(tau*n0)))
+  for(i in 1:n_treats){
+    for(j in 1:min_n){
+      t[j,i] = rnorm(1, mu, 1/sqrt(tau))
+      #n_samples[i] <- length(t[,i])
+    }}
+  
+  ntot <- min_n
+  
+  
+  
+  
+  while(TRUE){
+    if(ntot >= min_n){
+      ntot<- nrow(t)
+      post_mu <- matrix(NA, nrow=nsamps, ncol=n_treats)
+      n_new <- t(cbind(rep(0, n_treats))); colnames(n_new) <- treats 
+      ##get posterior data
+      mu_pos <- c(rep(0, n_treats))
+      beta_pos <- c(rep(0, n_treats))
+      alpha_pos <-c(rep(0, n_treats))
+      df <- c(rep(0, n_treats))
+      scale <- c(rep(0, n_treats))
+      location<-c(rep(0, n_treats))
+      #data comes from priors then samples 10000 from the posterior distribution
+      #https://en.wikipedia.org/wiki/Conjugate_prior
+      for(i in 1:n_treats){
+        mu_pos[i]=((n0a*mu0)+(ntot*mean(t[,i])))/(n0a+ntot)
+        beta_pos[i]=beta_a+.5*(sum((t[,i]-mean(t[,i]))^2))+
+          (ntot*n0a)/(ntot+n0a)*.5*((mean(t[,i])-mu0)^2)
+        alpha_pos[i] = alpha_a+ntot/2
+        n_pos= n0a+ntot 
+        df[i]=2*alpha_pos[i]
+        location[i]=mu_pos[i]
+        scale[i]=sqrt(beta_pos[i]/(n_pos*alpha_pos[i]))
+        post_mu[,i] = rt(nsamps, df[i])*scale[i]+mu_pos[i]           
+      }
+      #ntot<-nrow(t)
+      #SUCRA
+      ranking<-c(1:n_treats)
+      
+      cppFunction('NumericMatrix rankRows(NumericMatrix post_mu, NumericVector ranking) {
+  int nsamps = post_mu.nrow();
+  int n_treats = post_mu.ncol();
+  NumericMatrix ranks(nsamps, n_treats);
+  
+  for(int k = 0; k < nsamps; k++) {
+    NumericVector x = -post_mu.row(k);
+    NumericVector s = clone(x);
+    std::sort(s.begin(), s.end());
+    IntegerVector index(n_treats);
+    NumericVector ranked(n_treats);
+    
+    for(int i = 0; i < n_treats; i++) {
+      
+      for(int j = 0; j < n_treats; j++) {
+        if(x[j] == s[i]) {
+          index[j] = i+1;
+          
+        }
+      }
+    }
+    
+  
+
+    
+    ranks.row(k) = index;
+  }
+  
+  return ranks;
+}')
+      
+      ranks <- rankRows(post_mu=post_mu, ranking=ranking)
+      ranks<-t(ranks)
+      r.m <- matrix(nrow=n_treats, ncol=n_treats);rownames(r.m)<-treats 
+      
+      for(i in 1:n_treats){
+        for(j in 1:n_treats){
+          r.m[i,j]<-sum(ranks[i,] == j)/nsamps
+        }
+      } #get ranking matrix which has the probability of each rank for each treatment
+      
+      cdf <- apply(r.m, 1, cumsum) #get cumulative probabilities for ranking matrix
+      
+      if(nrow(cdf) >2){
+        sucra <- apply(cdf[-nrow(cdf),],2,mean) #calculate sucra
+      }else{
+        sucra <- cdf[1,]
+      }
+      
+      for(i in 1:n_treats){
+        # n.samples <- as.vector(n_samples[,treats[i]])
+        ind.state <- as.vector(ind[,treats[i]])
+        
+        if(ntot >= min_n){
+          if(ind.state == 0){
+            sucra_ <- as.numeric(sucra[treats[i]])
+            
+            if(sucra_ > thresh_sup){
+              Result["Sample.size", treats[i]] <- ntot
+              Result["Result", treats[i]] <- "Superiority"
+              ind[,treats[i]] = 1
+            }
+            
+            if(sucra_ < thresh_fut){
+              Result["Sample.size", treats[i]] <- ntot
+              Result["Result", treats[i]] <- "Inferiority"
+              ind[,treats[i]] = 2
+            }
+            
+            if(sucra_ <= thresh_sup && sucra_ >= thresh_fut){
+              Result["Sample.size", treats[i]] <- ntot
+              Result["Result", treats[i]] <- "Nothing"
+              ind[,treats[i]] = 0
+            }
+            
+            
+          } ###add scenario where if its the last treatment its superior
+        }
+        if(ntot >= max_n){
+          Result["Sample.size", treats[i]] <- ntot
+          # Result["Result", treats[i]] <- "Inconclusive"
+          ind[,treats[i]] = 1
+        }
+        
+        
+        
+        
+      }
+      
+      #if(sum(ind==1) >0){break}
+      #if(sum(ind==2)==n_treats){break}
+      
+      
+      if(sum(ind==2) > 0){
+        index <- which(ind==2)
+        n_treats <- n_treats - length(index)
+        treats <- treats[-index]
+        recruit_rate <- recruit_rate[-index]
+        recruit_rate <-matrix(recruit_rate,1,n_treats);colnames(recruit_rate) <- treats
+        n_new <- n_new[-index]
+        n_new <-matrix(n_new,1,n_treats);colnames(n_new) <- treats
+        ind <- ind[,-index]
+        ind <- matrix(ind,1,n_treats);colnames(ind) <- treats
+        t <- t[,-index]
+        
+        # post.mu <- post.mu[,-index]
+        
+        
+        for(j in 1:n_treats){
+          n_new[,treats[j]] <- recruit_rate[,treats[j]]}
+        n <- n_new + ntot
+        
+      }else{
+        
+        n_new <- t(cbind(rep(0, n_treats))); colnames(n_new) <- treats
+        for(j in 1:n_treats){
+          n_new[,treats[j]] <- recruit_rate[,treats[j]]}
+        n <- n_new + ntot
+        
+      }
+    }
+    
+    n_new <- n-min_n
+    
+    if(length(n) == 1){
+      Result["Sample.size", treats] <- ntot
+      Result["Result", treats] <- "Superiority"
+      
+      {break}
+    }
+    if(sum(ind==1) >0){break}
+    
+    tnew<-matrix(NA, nrow=recruit_rate, ncol=n_treats)
+    
+    
+    for(i in 1:n_treats){
+      for(j in 1:recruit){
+        
+        tnew[j,i] =  rnorm(1, mu, 1/sqrt(tau))
+        
+      }}
+    t<-rbind(t, tnew)
+  }
+  return(Result)
+}
+
+
+
+
+
+
+
+
+
+#parallel computing code
+n_sim <- 10000
+ncores <- detectCores() - 1
+cl <- makeCluster(ncores)
+registerDoParallel(cl)
+Sim_Res <- foreach(k = 1:n_sim, .combine = rbind,
+                   .packages = c("boot", "dplyr", "Rcpp")
+) %dopar% { 
+  set.seed(k + 123)
+  simulation(n_treats=n_treats,
+             min_n=min_n,
+             max_n=max_n,
+             thresh_sup=thresh_sup,
+             thresh_fut=thresh_fut,
+             mu0=mu0,
+             alpha0=alpha0,
+             beta0=beta0,
+             n0=n0,
+             treats=treats,
+             recruit=recruit) 
+}
+stopCluster(cl)
+
+
+results <- as.data.frame(Sim_Res)
+
+t1 <- sum(results=="Superiority")/n_sim
+
+
